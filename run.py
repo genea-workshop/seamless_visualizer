@@ -26,15 +26,16 @@ import numpy as np
 def get_texture(gender, num_person):
     # Depending if it is person 1 or 2, we use a different T-shirt color for helping with differentiating people.
     if gender == "male":
-        if num_person == 0:
-            return "smplh_files/textures/smplx_texture_m_alb.png"
-        else:
-            return "smplh_files/textures/smplx_texture_m_alb_v2.png"
+        base = "smplh_files/textures/smplx_texture_m_alb.png"
+        v2 = "smplh_files/textures/smplx_texture_m_alb_v2.png"
     else:
-        if num_person == 0:
-            return "smplh_files/textures/smplx_texture_f_alb.png"
-        else:
-            return "smplh_files/textures/smplx_texture_f_alb_v2.png"
+        base = "smplh_files/textures/smplx_texture_f_alb.png"
+        v2 = "smplh_files/textures/smplx_texture_f_alb_v2.png"
+
+    if num_person == 0:
+        return base
+
+    return v2 if os.path.exists(v2) else base
 
 
 def get_wav_duration(file_path):

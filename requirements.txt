@@ -1,0 +1,12 @@
+numpy
+torch
+torchaudio
+smplx
+ffmpeg-python
+pyrender
+trimesh
+Pillow
+opencv-python
+PyOpenGL
+tqdm
+torchcodec

@@ -41,17 +41,12 @@ Based on the visualizer from Meta [Embody-3D](https://github.com/facebookresearc
 
 ## Installation
 
-1. Create and activate a virtual environment:
+1. Create a virtual environment and install dependencies:
 
 ```bash
 conda create -n seamless_vis python=3.11 -y
-source .venv/bin/activate
-```
-
-2. Install Python dependencies:
-
-```bash
-pip install numpy torch torchaudio smplx ffmpeg-python pyrender trimesh Pillow opencv-python PyOpenGL tqdm torchcodec
+conda activate seamless_vis
+pip install -r requirements.txt
 ```
 
 3. Make sure the `ffmpeg` executable is installed on your system:
