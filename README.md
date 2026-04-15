@@ -21,24 +21,6 @@ Based on the visualizer from Meta [Embody-3D](https://github.com/facebookresearc
 - Support monadic and multiperson rendering
 - Includes texture selection for male/female characters
 
-## Requirements
-
-- Python 3.11 (recommended)
-- `numpy`
-- `torch`
-- `torchaudio`
-- `smplx`
-- `ffmpeg-python`
-- `pyrender`
-- `trimesh`
-- `Pillow`
-- `opencv-python`
-- `PyOpenGL`
-- `tqdm`
-- torchcodec
-- System `ffmpeg` installed and available on `PATH`
-
-
 ## Installation
 
 1. Create a virtual environment and install dependencies:
