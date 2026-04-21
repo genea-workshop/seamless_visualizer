@@ -38,13 +38,19 @@ trimesh.util.log.setLevel("ERROR")
 # Per-worker state (lives for the lifetime of the pool worker process)
 _fast_worker = {}
 
-def _init_fast_worker(renderer_args, faces, uvs_unrolled, shm_name, B, H, W, T_total):
-    """Pool initializer: create the EGL context and attach to shared memory once per worker."""
+def _init_fast_worker(renderer_args, faces, uvs_unrolled, shm_name, B, H, W, T_total, num_people, mask_obj_path):
+    """Pool initializer: Added mask loading for worker processes."""
     rend = PyrenderRenderer(**renderer_args)
     rend.faces = faces
     rend._uvs_unrolled = uvs_unrolled
+    
+    # Load the mask in the worker context
+    rend._load_mask(mask_obj_path)
 
-    bg_img = cv2.imread("utils/white_bg.png")
+    if num_people == 2:
+        bg_img = cv2.imread("utils/white_bg2.png")
+    else:
+        bg_img = cv2.imread("utils/white_bg.png")
     bg_img = cv2.resize(bg_img, (W, H))
     bg = cv2.cvtColor(bg_img, cv2.COLOR_BGR2RGB)
 
@@ -55,17 +61,11 @@ def _init_fast_worker(renderer_args, faces, uvs_unrolled, shm_name, B, H, W, T_t
     _fast_worker['bg'] = bg
     _fast_worker['shm'] = shm
     _fast_worker['result'] = result
-    _fast_worker['mesh_nodes'] = None  # created lazily on first task
-
+    _fast_worker['mesh_nodes'] = None
+    _fast_worker['mask_nodes'] = [] # Track masks per worker
 
 def _render_chunk_fast(args):
-    """Worker task: render a small batch of frames using the per-worker EGL context.
-
-    Returns the number of frames rendered so imap_unordered can drive tqdm.
-    """
     geom_chunk, textures, t_start = args
-    # geom_chunk: list of [B, T_chunk, N_remap, 3] float32
-
     rend    = _fast_worker['rend']
     bg      = _fast_worker['bg']
     result  = _fast_worker['result']
@@ -75,15 +75,19 @@ def _render_chunk_fast(args):
     if mesh_nodes is None or len(mesh_nodes) != n_persons:
         mesh_nodes = [None] * n_persons
 
-    B_local   = geom_chunk[0].shape[0]
-    T_chunk   = geom_chunk[0].shape[1]
+    B_local = geom_chunk[0].shape[0]
+    T_chunk = geom_chunk[0].shape[1]
 
     for b in range(B_local):
         for t in range(T_chunk):
             for i, gc in enumerate(geom_chunk):
+                # Update body geometry
                 mesh_nodes[i] = rend._update_mesh_geometry(
                     gc[b, t], mesh_nodes[i], texture_path=textures[i]
                 )
+                # Update mask geometry for this person
+                rend._update_mask_node_multi(gc[b, t], person_index=i)
+
             rgb, depth = rend.renderer.render(rend.scene, flags=rend.flags)
             mask = (depth > 0)[:, :, None]
             result[b, t_start + t] = np.where(mask, rgb, bg).transpose(2, 0, 1)
@@ -190,8 +194,72 @@ class PyrenderRenderer(nn.Module):
         self.rendering_height = rendering_height * 2
         self.rendering_width = rendering_width * 2
         self.magnification_factor = magnification_factor
+        self._mask_node = None
         self._setup_renderer()
+        self._load_mask('/Users/silviaarellanogarcia/Documents/PhD/genea_repo/seamless_visualizer/utils/mask_triangulated.obj')
+        
         # self._setup_floor() ## We don't need a floor because we are only generating the upper body and the camera is too close
+    
+    def _load_mask(self, mask_obj_path: str):
+        """Load mask OBJ and extract material properties from the associated .mtl."""
+        # trimesh will look for the .mtl file referenced inside the .obj automatically
+        mesh = trimesh.load(mask_obj_path, force='mesh', process=False)
+        mesh.vertices -= mesh.vertices.mean(axis=0)
+
+        # Orientation fix (90° rotation)
+        angle = np.deg2rad(90)
+        Rx = np.array([
+            [1,           0,            0],
+            [0, np.cos(angle), -np.sin(angle)],
+            [0, np.sin(angle),  np.cos(angle)],
+        ], dtype=np.float32)
+        
+        mesh.vertices = mesh.vertices @ Rx.T
+        self._mask_trimesh = mesh
+
+        # --- EXTRACT MATERIAL FROM .MTL ---
+        # Default fallback
+        base_color = [1.0, 1.0, 1.0, 1.0] 
+        texture = None
+
+        if hasattr(mesh.visual, 'material'):
+            material = mesh.visual.material
+            if hasattr(material, 'diffuse'):
+                color = np.array(material.diffuse, dtype=np.float32)
+                # Force normalization to 0.0 - 1.0
+                if color.max() > 1.0:
+                    color /= 255.0
+                base_color = color.tolist()
+                
+                if len(base_color) == 3:
+                    base_color.append(1.0) 
+
+                self._mask_material = pyrender.MetallicRoughnessMaterial(
+                    baseColorFactor=[1.0, 1.0, 1.0, 1.0],
+                    emissiveFactor=[0.3, 0.3, 0.3],
+                    metallicFactor=0.0,   # Set to 0 to avoid metallic reflections
+                    roughnessFactor=1.0,    # Set to 1 to make it matte/non-shiny
+                    alphaMode='OPAQUE'
+                )
+
+        # Create the pyrender material
+        if texture:
+            self._mask_material = pyrender.MetallicRoughnessMaterial(
+                baseColorTexture=texture,
+                emissiveFactor=[0.3, 0.3, 0.3],
+                metallicFactor=0.0,
+                roughnessFactor=1.0,
+                alphaMode='OPAQUE'
+            )
+        else:
+            self._mask_material = pyrender.MetallicRoughnessMaterial(
+                baseColorFactor=base_color,
+                emissiveFactor=[0.3, 0.3, 0.3],
+                metallicFactor=0.0,
+                roughnessFactor=1.0,
+                alphaMode='OPAQUE'
+            )
+
 
     def _compute_vertex_normals_torch(self, v: torch.Tensor):
         """Vectorized normal computation using PyTorch on GPU/CPU."""
@@ -333,7 +401,7 @@ class PyrenderRenderer(nn.Module):
 
         # Enhanced lighting setup for better detail visibility with reduced harsh shadows
         # Main directional light (good detail visibility)
-        main_light = pyrender.DirectionalLight(color=np.array([0.01, 0.01, 0.01]), intensity=4.0)
+        main_light = pyrender.DirectionalLight(color=np.array([0.01, 0.01, 0.01]), intensity=1.0)
         main_light_pos = torch.tensor([0, -5e3, 5e3], dtype=torch.float)
         main_lightRT = self._viewmatrix(center, up, main_light_pos)
         main_lightRT = torch.cat([main_lightRT, torch.tensor([[0, 0, 0, 1]])], dim=0)
@@ -356,7 +424,8 @@ class PyrenderRenderer(nn.Module):
         self.floor = pyrender.Mesh.from_trimesh(floor_tri, smooth=False)
         self.scene.add(self.floor)
     
-    def forward(self, geometry_list, x_offset=[0, 0], textures=None, num_workers=8):
+    def forward(self, geometry_list, x_offset=[0, 0], textures=None, num_workers=4):
+        num_people = len(geometry_list)
         B, T = geometry_list[0].shape[:2]
         H, W = self.rendering_height, self.rendering_width
 
@@ -376,14 +445,17 @@ class PyrenderRenderer(nn.Module):
             geom_ready.append(gn[:, :, self.remap_v_idx])  # [B, T, N_remap, 3]
 
         if num_workers == 1:
-            return self._forward_single(geom_ready, textures, B, T, H, W)
+            return self._forward_single(geom_ready, textures, B, T, H, W, num_people)
         else:
-            return self._forward_parallel(geom_ready, textures, B, T, H, W, num_workers)
+            return self._forward_parallel(geom_ready, textures, B, T, H, W, num_people, num_workers)
 
-    def _forward_single(self, geom_ready, textures, B, T, H, W):
+    def _forward_single(self, geom_ready, textures, B, T, H, W, num_people):
         """Single-process rendering path."""
         if self._bg is None:
-            bg_img = cv2.imread("white_bg2.png")
+            if num_people == 2:
+                bg_img = cv2.imread("utils/white_bg2.png")
+            else:
+                bg_img = cv2.imread("utils/white_bg.png")
             bg_img = cv2.resize(bg_img, (W, H))
             self._bg = cv2.cvtColor(bg_img, cv2.COLOR_BGR2RGB)
 
@@ -397,15 +469,17 @@ class PyrenderRenderer(nn.Module):
                         mesh_nodes[i] = self._update_mesh_geometry(
                             g_remap[b, t], mesh_nodes[i], texture_path=textures[i]
                         )
+                        
+                        if hasattr(self, '_mask_trimesh'):
+                            self._update_mask_node_multi(g_remap[b, t], person_index=i)
 
                     rgb, depth = self.renderer.render(self.scene, flags=self.flags)
                     mask = (depth > 0)[:, :, None]
                     result[b, t] = np.where(mask, rgb, self._bg).transpose(2, 0, 1)
                     pbar.update(1)
-
         return result
 
-    def _forward_parallel(self, geom_ready, textures, B, T, H, W, num_workers):
+    def _forward_parallel(self, geom_ready, textures, B, T, H, W, num_people, num_workers):
         """Multi-process rendering path: splits frames across num_workers EGL contexts.
 
         Workers are initialized once (EGL context created once per worker), then fed
@@ -433,11 +507,16 @@ class PyrenderRenderer(nn.Module):
             tasks.append((geom_chunk, textures, t))
             t = t_end
 
+        mask_path = 'utils/mask_triangulated.obj'
+
         initargs = (
             renderer_args,
             self.faces, self._uvs_unrolled,
             shm.name, B, H, W, T,
+            num_people,
+            mask_path # Pass the path here
         )
+        
         with mp.Pool(
             processes=num_workers,
             initializer=_init_fast_worker,
@@ -464,6 +543,44 @@ class PyrenderRenderer(nn.Module):
         glBindBuffer(GL_ARRAY_BUFFER, primitive._buffers[0])
         glBufferSubData(GL_ARRAY_BUFFER, 0, vertex_data.nbytes, vertex_data)
         glBindBuffer(GL_ARRAY_BUFFER, 0)
+    
+    def _update_mask_node_multi(self, v_remapped: np.ndarray, person_index: int, scale: float = 1.0):
+        pose = self._get_face_pose(v_remapped)
+        pose[:3, :3] *= scale
+
+        if not hasattr(self, '_mask_nodes'):
+            self._mask_nodes = []
+        if not hasattr(self, '_mask_light_nodes'):
+            self._mask_light_nodes = []
+        
+        while len(self._mask_nodes) <= person_index:
+            self._mask_nodes.append(None)
+        while len(self._mask_light_nodes) <= person_index:
+            self._mask_light_nodes.append(None)
+
+        # Reuse the mesh object, but remove the old NODE from the scene
+        if not hasattr(self, '_mask_mesh'):
+            material = getattr(self, '_mask_material', None)
+            self._mask_mesh = pyrender.Mesh.from_trimesh(self._mask_trimesh, material=material, smooth=False)
+
+        # Clean up old frame's nodes
+        if self._mask_nodes[person_index] is not None:
+            try:
+                self.scene.remove_node(self._mask_nodes[person_index])
+            except ValueError: pass
+        
+        if self._mask_light_nodes[person_index] is not None:
+            try:
+                self.scene.remove_node(self._mask_light_nodes[person_index])
+            except ValueError: pass
+
+        # Add the mask mesh
+        self._mask_nodes[person_index] = self.scene.add(self._mask_mesh, pose=pose)
+
+        # Add a directional light to light up the mask
+        face_light = pyrender.DirectionalLight(color=np.ones(3), intensity=0.4)
+        light_pose = pose.copy()
+        self._mask_light_nodes[person_index] = self.scene.add(face_light, pose=light_pose)
 
     def _update_mesh_geometry(self, v_remapped: np.ndarray, mesh_node, texture_path: str = 'smplh_files/textures/smplx_texture_m_alb.png'):
         # Unroll vertices by face (winding-flipped faces)
@@ -517,3 +634,72 @@ class PyrenderRenderer(nn.Module):
                 mesh_node.mesh.primitives[0], positions, normals
             )
             return mesh_node
+        
+    def _update_mask_node(self, v_remapped: np.ndarray, scale: float = 1.0):
+        """Add or update the mask mesh node in the scene."""
+        pose = self._get_face_pose(v_remapped)
+        pose[:3, :3] *= scale
+
+        # Build the pyrender Mesh once and reuse it
+        if not hasattr(self, '_mask_mesh'):
+            self._mask_mesh = pyrender.Mesh.from_trimesh(self._mask_trimesh, smooth=False)
+        
+        if not hasattr(self, '_mask_light'):
+            light = pyrender.PointLight(
+                color=np.ones(3),
+                intensity=0.04
+            )
+            self._mask_light = self.scene.add(light, pose=np.eye(4))
+        
+        # Offset the light slightly in front of the mask
+        light_pose = pose.copy()
+        light_pose[:3, 3] += pose[:3, 2] * 0.2
+
+        self.scene.set_pose(self._mask_light, pose=light_pose)
+
+        # remove and re-add each frame
+        if self._mask_node is not None:
+            self.scene.remove_node(self._mask_node)
+
+        self._mask_node = self.scene.add(self._mask_mesh, pose=pose)
+
+    def _get_face_pose(self, v_remapped: np.ndarray) -> np.ndarray:
+        def get_v(orig_idx):
+            return v_remapped[self.orig_to_remap[orig_idx]].copy()
+
+        # Landmarks
+        upper_nose_tip  = get_v(330)
+        left_eye  = get_v(2800)
+        right_eye = get_v(6260)
+        lower_nose_tip  = get_v(332)
+        
+        # Vector from right eye to left eye
+        right_vec = left_eye - right_eye
+        right_vec /= (np.linalg.norm(right_vec) + 1e-8)
+
+        # Vector in the upward direction
+        approx_up = upper_nose_tip - lower_nose_tip
+        approx_up /= (np.linalg.norm(approx_up) + 1e-8)
+
+        # Forward Vector (Depth/Normal of the face)
+        # This is perpendicular to the eye-line and the forehead-nose line, ensuring the mask is parallel to the 'plane' of the face
+        forward = np.cross(right_vec, approx_up)
+        forward /= (np.linalg.norm(forward) + 1e-8)
+
+        # Corrected Up Vector
+        # Re-calculate Up to ensure strict orthogonality (90 degrees to Forward and Right)
+        # This removes the 'tilt' caused by the nose being further forward than the forehead
+        up_vec = np.cross(forward, right_vec)
+        up_vec /= (np.linalg.norm(up_vec) + 1e-8)
+
+        # Center the mask on the bridge of the nose (between eyes) 
+        # and push it slightly forward
+        face_center = (left_eye + right_eye) / 2.0
+        face_center += forward * 0.02
+
+        pose = np.eye(4, dtype=np.float32)
+        pose[:3, 0] = right_vec
+        pose[:3, 1] = up_vec
+        pose[:3, 2] = forward
+        pose[:3, 3] = face_center
+        return pose

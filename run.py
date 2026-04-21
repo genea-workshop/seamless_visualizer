@@ -171,13 +171,19 @@ def load_and_visualize_data_model(args, gender_json, renderer=None):
     }]
 
     if args.multiperson:
-        x_offset = [0.65, -0.65]
+        x_offset = [0.8, -0.8]
         other_batch = load_smplh(args, args.motion_npz[1], seq_len)
         people.append({
             "batch": other_batch,
             "gender": args.gender[1],
             "audio": args.audio_files[1] if len(args.audio_files) > 1 else None
         })
+        right_person_id = batch['seq_name'].split('_')[3]
+        # VXX_S[SESSION ID]_I[INTERACTION ID]_P[ID PERSON ON THE LEFT]_P[ID PERSON ON THE RIGHT]--[SEQ STARTING SECOND]
+        base_name = f"{other_batch['seq_name']}_{right_person_id}--{batch['starting_second']}"
+
+    else:
+        base_name = f"{batch['seq_name']}--{batch['starting_second']}"
 
     # Gender detection
     for p in people:
@@ -215,8 +221,6 @@ def load_and_visualize_data_model(args, gender_json, renderer=None):
         verts_list.append(verts)
         textures.append(get_texture(p["gender"], count))
 
-    t0 = time.time()
-
     nodes_to_remove = [node for node in renderer.scene.mesh_nodes]
     for node in nodes_to_remove:
         renderer.scene.remove_node(node)
@@ -224,11 +228,9 @@ def load_and_visualize_data_model(args, gender_json, renderer=None):
     video_frames = renderer(verts_list, x_offset=x_offset, textures=textures)[0]
     # Transpose (T,3,H,W) → (T,H,W,3) and ensure C-contiguous uint8 in one allocation.
     # ascontiguousarray on a non-contiguous transpose avoids the separate tobytes copy.
-    t0 = time.time()
     video_frames = np.ascontiguousarray(video_frames.transpose(0, 2, 3, 1), dtype=np.uint8)
 
     # Save the silent video
-    base_name = f"{batch['seq_name']}--{batch['starting_second']}"
     temp_video_path = f"{output_dir}/{base_name}_temp.mp4"
     final_path = f"{output_dir}/{base_name}.mp4"
 
