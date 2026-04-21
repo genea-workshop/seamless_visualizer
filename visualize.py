@@ -196,7 +196,7 @@ class PyrenderRenderer(nn.Module):
         self.magnification_factor = magnification_factor
         self._mask_node = None
         self._setup_renderer()
-        self._load_mask('/Users/silviaarellanogarcia/Documents/PhD/genea_repo/seamless_visualizer/utils/mask_triangulated.obj')
+        self._load_mask('utils/mask_triangulated.obj')
         
         # self._setup_floor() ## We don't need a floor because we are only generating the upper body and the camera is too close
     
